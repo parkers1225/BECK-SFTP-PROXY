@@ -75,20 +75,10 @@ async function loadVehicleData() {
       vehicleData = result.selectedVehicle;
       generatedDescription = result.generatedDescription;
       
-      // Debug: Log vehicle data to verify mileage is present
-      console.log('Loaded vehicle data:', {
-        vin: vehicleData.vin,
-        make: vehicleData.make,
-        model: vehicleData.model,
-        mileage: vehicleData.mileage,
-        mileageUnit: vehicleData.mileageUnit,
-        hasMileage: !!vehicleData.mileage,
-        allKeys: Object.keys(vehicleData)
-      });
-      
-      if (!vehicleData.mileage) {
-        console.warn('⚠️ WARNING: Mileage is missing from vehicle data!', vehicleData);
-      }
+      // Keep the page console free of full vehicle records (address etc.); log only what
+      // matters for diagnosing a missed fill.
+      console.log('Loaded vehicle data:', { vin: vehicleData.vin, mileage: vehicleData.mileage, keys: Object.keys(vehicleData).length });
+      if (!vehicleData.mileage) console.warn('⚠️ Mileage is missing from vehicle data');
       
       return true;
     }
@@ -1133,255 +1123,6 @@ async function fillYearValue(elem, yearValue) {
 }
 
 /**
- * Fill Year, Make, Model fields if they exist separately
- */
-async function fillYearMakeModel() {
-  console.log('Filling Year/Make/Model fields...');
-  
-  // Fill Year
-  if (vehicleData.year) {
-    const yearField = findYearField();
-    if (yearField) {
-      console.log('Found Year field, filling:', vehicleData.year);
-      yearField.focus();
-      await sleep(150);
-      
-      // Try clicking if it's a button/combobox
-      if (yearField.tagName === 'BUTTON' || yearField.getAttribute('role') === 'combobox' || 
-          yearField.getAttribute('role') === 'button' || yearField.getAttribute('role') === 'listbox') {
-        yearField.click();
-        await sleep(1000); // Wait for dropdown to open
-        // Look for the year option in dropdown - :has-text() doesn't work, so search manually
-        const yearStr = String(vehicleData.year);
-        const allOptions = document.querySelectorAll('div[role="option"], div[role="menuitem"], li[role="option"], li[role="menuitem"], span[role="option"]');
-        
-        let yearOption = null;
-        for (const opt of allOptions) {
-          const optText = (opt.textContent || '').trim();
-          if (optText === yearStr || optText.includes(yearStr)) {
-            // Make sure it's visible
-            const rect = opt.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) {
-              yearOption = opt;
-              break;
-            }
-          }
-        }
-        
-        if (yearOption) {
-          console.log('Clicking year option:', yearOption.textContent);
-          yearOption.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          await sleep(200);
-          yearOption.click();
-          await sleep(500);
-        } else {
-          console.warn('Year option not found in dropdown. Available options:', 
-            Array.from(allOptions).slice(0, 5).map(o => o.textContent));
-        }
-      } else if (yearField.tagName === 'SELECT') {
-        const option = Array.from(yearField.options).find(opt => 
-          opt.text.includes(vehicleData.year) || opt.value === vehicleData.year || opt.value === String(vehicleData.year)
-        );
-        if (option) {
-          yearField.value = option.value;
-          yearField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        } else {
-          console.warn('Year option not found in select');
-        }
-      } else {
-        // Clear first
-        if (yearField.value !== undefined) {
-          yearField.value = '';
-        } else if (yearField.textContent !== undefined) {
-          yearField.textContent = '';
-        }
-        await sleep(50);
-        
-        // Fill value
-        if (yearField.value !== undefined) {
-          yearField.value = vehicleData.year;
-        } else if (yearField.textContent !== undefined) {
-          yearField.textContent = vehicleData.year;
-        }
-        
-        yearField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        yearField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-      }
-      await sleep(200);
-    } else {
-      console.warn('Year field not found via findYearField() - trying alternative methods');
-      
-      // Method 1: Find "Year" label text and locate nearby interactive element
-      const yearLabels = Array.from(document.querySelectorAll('label, span, div, p, h1, h2, h3, h4, h5, h6')).filter(el => {
-        const text = (el.textContent || '').trim().toLowerCase();
-        return (text === 'year' || text === 'year:') && el.offsetParent !== null;
-      });
-      
-      console.log(`Found ${yearLabels.length} potential Year labels`);
-      
-      for (const label of yearLabels) {
-        // Strategy: Find the parent container, then find interactive elements within it
-        let container = label.parentElement;
-        let depth = 0;
-        
-        while (container && depth < 5) {
-          // Look for interactive elements in this container
-          const interactiveElements = container.querySelectorAll('input, select, button, [contenteditable="true"], [role="button"], [role="combobox"], div[role="listbox"]');
-          
-          for (const elem of interactiveElements) {
-            if (elem.offsetParent === null || elem.disabled) continue;
-            
-            // Check if this element is associated with "Year" (not Make/Model)
-            const elemContext = (elem.closest('div')?.textContent || '').toLowerCase();
-            const elemIndex = elemContext.indexOf('year');
-            const makeIndex = elemContext.indexOf('make');
-            const modelIndex = elemContext.indexOf('model');
-            
-            // Year should come before Make and Model
-            if (elemIndex !== -1 && 
-                (makeIndex === -1 || elemIndex < makeIndex) &&
-                (modelIndex === -1 || elemIndex < modelIndex)) {
-              console.log('Found Year field via label traversal, filling:', vehicleData.year);
-              
-              await fillYearValue(elem, vehicleData.year);
-              return; // Success, exit
-            }
-          }
-          
-          // Also check siblings of the container
-          if (container.parentElement) {
-            const siblings = Array.from(container.parentElement.children);
-            const containerIndex = siblings.indexOf(container);
-            
-            // Check next sibling (often the input is a sibling)
-            if (containerIndex < siblings.length - 1) {
-              const nextSibling = siblings[containerIndex + 1];
-              const interactive = nextSibling.querySelector('input, select, button, [contenteditable="true"], [role="button"], [role="combobox"]');
-              if (interactive && interactive.offsetParent !== null && !interactive.disabled) {
-                console.log('Found Year field as next sibling, filling:', vehicleData.year);
-                await fillYearValue(interactive, vehicleData.year);
-                return;
-              }
-            }
-          }
-          
-          container = container.parentElement;
-          depth++;
-        }
-      }
-      
-      // Method 2: Find form fields by DOM order (Year is typically first in vehicle forms)
-      const vehicleFormSection = Array.from(document.querySelectorAll('div, section, form')).find(section => {
-        const text = (section.textContent || '').toLowerCase();
-        return text.includes('year') && text.includes('make') && text.includes('model') && 
-               text.indexOf('year') < text.indexOf('make') && text.indexOf('make') < text.indexOf('model');
-      });
-      
-      if (vehicleFormSection) {
-        console.log('Found vehicle form section, looking for first field (Year)');
-        const allFields = vehicleFormSection.querySelectorAll('input, select, button, [contenteditable="true"], [role="button"], [role="combobox"]');
-        
-        // The first visible field is likely Year
-        for (const field of allFields) {
-          if (field.offsetParent !== null && !field.disabled) {
-            const fieldContext = (field.closest('div')?.textContent || '').toLowerCase();
-            if (fieldContext.includes('year') && !fieldContext.includes('make') && !fieldContext.includes('model')) {
-              console.log('Found Year field as first field in form section, filling:', vehicleData.year);
-              await fillYearValue(field, vehicleData.year);
-              return;
-            }
-          }
-        }
-      }
-      
-      console.error('Could not find Year field with any method');
-    }
-  }
-  
-  // Fill Make (ONLY the make, not the full title)
-  if (vehicleData.make) {
-    const makeField = findMakeField();
-    if (makeField) {
-      console.log('Found Make field, filling:', vehicleData.make);
-      makeField.focus();
-      await sleep(100);
-      
-      if (makeField.tagName === 'SELECT') {
-        const option = Array.from(makeField.options).find(opt => 
-          opt.text.toLowerCase().includes(vehicleData.make.toLowerCase()) ||
-          opt.value.toLowerCase().includes(vehicleData.make.toLowerCase())
-        );
-        if (option) {
-          makeField.value = option.value;
-          makeField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        }
-      } else {
-        // Clear first
-        if (makeField.value !== undefined) {
-          makeField.value = '';
-        } else {
-          makeField.textContent = '';
-        }
-        await sleep(50);
-        
-        // Fill with ONLY the make
-        if (makeField.value !== undefined) {
-          makeField.value = vehicleData.make;
-        } else {
-          makeField.textContent = vehicleData.make;
-        }
-        makeField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        makeField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-      }
-      await sleep(200);
-    } else {
-      console.warn('Make field not found');
-    }
-  }
-  
-  // Fill Model (ONLY the model, not the full title)
-  if (vehicleData.model) {
-    const modelField = findModelField();
-    if (modelField) {
-      console.log('Found Model field, filling:', vehicleData.model);
-      modelField.focus();
-      await sleep(100);
-      
-      if (modelField.tagName === 'SELECT') {
-        const option = Array.from(modelField.options).find(opt => 
-          opt.text.toLowerCase().includes(vehicleData.model.toLowerCase()) ||
-          opt.value.toLowerCase().includes(vehicleData.model.toLowerCase())
-        );
-        if (option) {
-          modelField.value = option.value;
-          modelField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        }
-      } else {
-        // Clear first
-        if (modelField.value !== undefined) {
-          modelField.value = '';
-        } else {
-          modelField.textContent = '';
-        }
-        await sleep(50);
-        
-        // Fill with ONLY the model
-        if (modelField.value !== undefined) {
-          modelField.value = vehicleData.model;
-        } else {
-          modelField.textContent = vehicleData.model;
-        }
-        modelField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        modelField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-      }
-      await sleep(200);
-    } else {
-      console.warn('Model field not found');
-    }
-  }
-}
-
-/**
  * Fill Year field only (before Vehicle Type selection)
  */
 async function fillYearFieldOnly() {
@@ -1566,93 +1307,71 @@ async function fillMakeFieldAfterVehicleType() {
  */
 async function fillModelFieldAfterVehicleType() {
   if (!vehicleData.model) return false;
-  
-  for (let attempt = 0; attempt < 8; attempt++) {
+
+  // Same shape as the Make filler: wait for the field to exist rather than sleeping
+  // a fixed 800ms between attempts (the Model field appears right after Make is set).
+  for (let attempt = 0; attempt < 5; attempt++) {
     if (attempt > 0) {
-      await sleep(800);
+      const earlyField = await waitForElement(findModelField, { timeout: 1000, interval: 100 });
+      if (!earlyField) await smartSleep(400);
     }
     const modelField = findModelField();
-    if (modelField) {
-      console.log(`Filling Model field after Vehicle Type (attempt ${attempt + 1}):`, vehicleData.model);
-      modelField.focus();
-      await sleep(200);
-      
-      // Check if it's a combobox/dropdown (needs to be clicked to open)
-      if (modelField.getAttribute('role') === 'combobox' || modelField.tagName === 'LABEL' || 
-          modelField.tagName === 'BUTTON' || modelField.getAttribute('role') === 'button') {
-        console.log('Model field is a combobox, opening dropdown...');
-        modelField.click();
-        await waitForElement(() => document.querySelector('[role="option"], [role="menuitem"]'), { timeout: 3000, interval: 50 }); // wait for dropdown to open
-        
-        // Search for the model option in the dropdown
-        const options = document.querySelectorAll('[role="option"], [role="menuitem"], div[class*="option"], li[role="option"], label[role="option"], span[role="option"]');
-        const modelOption = Array.from(options).find(opt => {
-          const optText = (opt.textContent || '').toLowerCase().trim();
-          const modelLower = vehicleData.model.toLowerCase().trim();
-          return optText === modelLower || optText.includes(modelLower) || modelLower.includes(optText);
-        });
-        
-        if (modelOption) {
-          console.log('Found Model option in dropdown:', modelOption.textContent);
-          modelOption.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          await sleep(300);
-          modelOption.click();
-          await sleep(500);
-          console.log('✓ Model field filled successfully via dropdown');
-          return true;
-        } else {
-          console.warn('Model option not found in dropdown. Available options (first 5):', 
-            Array.from(options).slice(0, 5).map(o => o.textContent.trim()));
-        }
-      } else if (modelField.tagName === 'SELECT') {
-        // Handle select dropdown
-        const option = Array.from(modelField.options).find(opt => 
-          opt.text.toLowerCase().includes(vehicleData.model.toLowerCase()) ||
-          opt.value.toLowerCase().includes(vehicleData.model.toLowerCase())
-        );
-        if (option) {
-          modelField.value = option.value;
-          modelField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-          await sleep(200);
-          console.log('✓ Model field filled successfully via select');
-          return true;
-        }
-      } else {
-        // Regular input field
-        // Clear the field first
-        if (modelField.value !== undefined) {
-          modelField.value = '';
-        } else if (modelField.textContent !== undefined) {
-          modelField.textContent = '';
-        } else if (modelField.innerText !== undefined) {
-          modelField.innerText = '';
-        }
-        
-        // Dispatch events to clear
-        modelField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        modelField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        await sleep(100);
-        
-        // Fill with the model value
-        if (modelField.value !== undefined) {
-          modelField.value = vehicleData.model;
-        } else if (modelField.textContent !== undefined) {
-          modelField.textContent = vehicleData.model;
-        } else if (modelField.innerText !== undefined) {
-          modelField.innerText = vehicleData.model;
-        }
-        
-        // Dispatch comprehensive events for React
-        modelField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        modelField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        await sleep(300);
-        console.log('✓ Model field filled successfully via input');
+    if (!modelField) continue;
+
+    console.log(`Filling Model field after Vehicle Type (attempt ${attempt + 1}):`, vehicleData.model);
+    modelField.focus();
+    await smartSleep(100);
+
+    // Combobox/dropdown: open it and pick the matching option
+    if (modelField.getAttribute('role') === 'combobox' || modelField.tagName === 'LABEL' ||
+        modelField.tagName === 'BUTTON' || modelField.getAttribute('role') === 'button') {
+      console.log('Model field is a combobox, opening dropdown...');
+      modelField.click();
+      await waitForCondition(() => document.querySelectorAll('[role="option"], [role="menuitem"]').length > 0,
+        { timeout: 2000, interval: 50 });
+
+      const options = document.querySelectorAll('[role="option"], [role="menuitem"], div[class*="option"], li[role="option"], label[role="option"], span[role="option"]');
+      const modelLower = vehicleData.model.toLowerCase().trim();
+      const modelOption = Array.from(options).find(opt => {
+        const optText = (opt.textContent || '').toLowerCase().trim();
+        return optText === modelLower || optText.includes(modelLower) || modelLower.includes(optText);
+      });
+
+      if (modelOption) {
+        console.log('Found Model option in dropdown:', modelOption.textContent);
+        modelOption.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await smartSleep(100);
+        modelOption.click();
+        await smartSleep(200);
+        console.log('✓ Model field filled successfully via dropdown');
         return true;
       }
+      console.warn('Model option not found in dropdown. Available options (first 5):',
+        Array.from(options).slice(0, 5).map(o => o.textContent.trim()));
+    } else if (modelField.tagName === 'SELECT') {
+      const option = Array.from(modelField.options).find(opt =>
+        opt.text.toLowerCase().includes(vehicleData.model.toLowerCase()) ||
+        opt.value.toLowerCase().includes(vehicleData.model.toLowerCase())
+      );
+      if (option) {
+        modelField.value = option.value;
+        modelField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        await smartSleep(100);
+        console.log('✓ Model field filled successfully via select');
+        return true;
+      }
+    } else {
+      // Plain text input: set it the React way so the value tracker registers it
+      setNativeValue(modelField, '');
+      await smartSleep(50);
+      setNativeValue(modelField, vehicleData.model);
+      await smartSleep(100);
+      console.log('✓ Model field filled successfully via input');
+      return true;
     }
   }
-  
-  console.warn('Model field not found when trying to fill after Vehicle Type (tried 8 times)');
+
+  console.warn('Model field not found when trying to fill after Vehicle Type (tried 5 times)');
   return false;
 }
 
@@ -2250,18 +1969,13 @@ async function fillDescription() {
   if (textarea.tagName === 'TEXTAREA' || textarea.tagName === 'INPUT') {
     setNativeValue(textarea, generatedDescription);
   } else {
-    // Contenteditable div
-    textarea.textContent = generatedDescription;
-    textarea.innerText = generatedDescription;
-    
-    // Also try innerHTML with line breaks
-    if (textarea.innerHTML !== undefined) {
-      textarea.innerHTML = generatedDescription
-        .replace(/\n\n/g, '</p><p>')
-        .replace(/\n/g, '<br>')
-        .replace(/^/, '<p>')
-        .replace(/$/, '</p>');
-    }
+    // Contenteditable div: build real text + <br> nodes. Never innerHTML — the
+    // description is model output, and any markup in it would run in Facebook's page.
+    textarea.textContent = '';
+    String(generatedDescription).split('\n').forEach((line, i) => {
+      if (i) textarea.appendChild(document.createElement('br'));
+      if (line) textarea.appendChild(document.createTextNode(line));
+    });
   }
   
   // Trigger multiple events for React
@@ -2281,9 +1995,15 @@ async function fillDescription() {
   textarea.blur();
   await sleep(100);
   textarea.focus();
-  
+
+  // Honest result: succeed only if the text actually stuck (React can silently
+  // revert a value it didn't register), so the popup can warn the rep instead of
+  // reporting a description that isn't there.
   await sleep(300);
-  return true;
+  const now = (textarea.tagName === 'TEXTAREA' || textarea.tagName === 'INPUT') ? (textarea.value || '') : (textarea.textContent || '');
+  const ok = now.trim().length >= Math.min(40, generatedDescription.trim().length * 0.5);
+  if (!ok) console.warn('Description did not stick (read back', now.length, 'chars)');
+  return ok;
 }
 
 /**
@@ -2305,7 +2025,7 @@ async function fillCategory() {
       for (const button of buttons) {
         if (button && button.offsetParent !== null) {
           const text = (button.textContent || button.getAttribute('aria-label') || '').toLowerCase();
-          if (text.includes('category') || text.includes('select')) {
+          if (text.includes('category')) {   // 'select' alone matched unrelated pickers
             button.click();
             await sleep(800); // Wait longer for dropdown
             
@@ -2687,12 +2407,12 @@ async function fillVehicleType() {
         for (let i = 0; i < 10; i++) {
           if (!container) break;
           const containerText = (container.textContent || '').toLowerCase();
-          // Must have "vehicle type" and NOT have "make" or "model" nearby
-          if (containerText.includes('vehicle type') && 
-              !containerText.includes('make') && 
-              !containerText.includes('model') &&
-              containerText.indexOf('vehicle type') < (containerText.indexOf('make') || 999) &&
-              containerText.indexOf('vehicle type') < (containerText.indexOf('model') || 999)) {
+          // Must have "vehicle type" and NOT have "make" or "model" nearby.
+          // (The old `indexOf('make') || 999` guard compared against -1 when "make"
+          // was absent, so this fallback could never match.)
+          if (containerText.includes('vehicle type') &&
+              !containerText.includes('make') &&
+              !containerText.includes('model')) {
             isVehicleTypeField = true;
             break;
           }
@@ -3169,65 +2889,6 @@ async function fillDropdownField(labelText, value) {
 }
 
 /**
- * Re-fill Make field after Vehicle Type selection
- */
-async function refillMakeField() {
-  if (!vehicleData.make) return false;
-  
-  // Try multiple times as the field might not be ready immediately
-  // Increase wait time between attempts
-  for (let attempt = 0; attempt < 8; attempt++) {
-    if (attempt > 0) {
-      await sleep(800); // Longer wait between attempts
-    }
-    const makeField = findMakeField();
-    if (makeField) {
-      console.log(`Re-filling Make field after Vehicle Type (attempt ${attempt + 1}):`, vehicleData.make);
-      makeField.focus();
-      await sleep(200);
-      
-      // Clear the field
-      if (makeField.value !== undefined) {
-        makeField.value = '';
-      } else if (makeField.textContent !== undefined) {
-        makeField.textContent = '';
-      } else if (makeField.innerText !== undefined) {
-        makeField.innerText = '';
-      }
-      
-      // Dispatch events to clear
-      makeField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-      makeField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-      await sleep(100);
-      
-      // Fill with the make value
-      if (makeField.value !== undefined) {
-        makeField.value = vehicleData.make;
-      } else if (makeField.textContent !== undefined) {
-        makeField.textContent = vehicleData.make;
-      } else if (makeField.innerText !== undefined) {
-        makeField.innerText = vehicleData.make;
-      }
-      
-      // Dispatch comprehensive events for React
-      makeField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-      makeField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-      makeField.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'a', ctrlKey: true }));
-      makeField.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'a', ctrlKey: true }));
-      makeField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-      makeField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-      await sleep(300);
-      console.log('✓ Make field re-filled successfully');
-      return true;
-    }
-    // Wait is now handled at the start of the loop
-  }
-  
-  console.warn('Make field not found when trying to re-fill after Vehicle Type (tried 8 times)');
-  return false;
-}
-
-/**
  * Fill Mileage field
  */
 async function fillMileageField() {
@@ -3676,11 +3337,14 @@ function detectUploadedPhotos() {
   ];
   
   const formArea = document.querySelector('[role="main"]') || document.body;
-  
+  // Facebook's chrome is full of small scontent images (avatars, icons); only a
+  // thumbnail-sized image counts as an attached listing photo.
+  const isPhotoSized = (el) => el.tagName !== 'IMG' || (el.clientWidth || el.naturalWidth || 0) >= 80;
+
   for (const selector of indicators) {
     try {
       const found = document.querySelectorAll(selector);
-      const inForm = Array.from(found).filter(el => formArea.contains(el));
+      const inForm = Array.from(found).filter(el => formArea.contains(el) && isPhotoSized(el));
       if (inForm.length > 0) {
         console.log(`detectUploadedPhotos: Found ${inForm.length} via "${selector}"`);
         return true;
@@ -3860,18 +3524,6 @@ async function smartSleep(ms, earlyExit = null) {
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-
-// Listen for page navigation (Facebook uses SPA)
-let lastUrl = location.href;
-new MutationObserver(() => {
-  const url = location.href;
-  if (url !== lastUrl) {
-    lastUrl = url;
-    if (url.includes('/marketplace/create')) {
-      console.log('Facebook Marketplace create page detected');
-    }
-  }
-}).observe(document, { subtree: true, childList: true });
 
 })(); // End IIFE
 

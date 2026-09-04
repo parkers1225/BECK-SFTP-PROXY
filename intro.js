@@ -3,15 +3,22 @@
  * BeckLogoIntro / HeroScene. A wireframe icosahedron cage with an orbiting light
  * ring (live three.js) breathes behind the chrome "beck" badge, which punches in
  * with a blue bloom, then the whole thing fades and the WebGL context is disposed
- * (the showpiece greets you and leaves — 3D shouldn't linger). Plays on every open.
+ * (the showpiece greets you and leaves — 3D shouldn't linger). Plays once per
+ * browser session — the first open, not every time the panel is re-opened mid-shift.
  */
 import * as THREE from './lib/three.module.min.js';
 
-(function runIntro() {
+(async function runIntro() {
   // Respect reduced-motion: skip the showpiece entirely.
   try {
     if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   } catch (e) {}
+  // Once per session (chrome.storage.session clears when the browser closes).
+  try {
+    const s = await chrome.storage.session.get('introShown');
+    if (s && s.introShown) return;
+    chrome.storage.session.set({ introShown: true });
+  } catch (e) { /* no session storage here — just play it */ }
 
   const overlay = document.createElement('div');
   overlay.id = 'introOverlay';

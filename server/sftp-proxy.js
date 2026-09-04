@@ -35,6 +35,35 @@ const IMAGE_PROXY_ALLOWED_DOMAINS = [
   'cai-media-management.com',
 ];
 
+app.set('trust proxy', 1);   // Railway sits behind a proxy — needed for a correct req.ip
+
+// Process-level guards: log instead of dying. A single-instance proxy that crashes on
+// one unhandled error takes every rep down, and Railway caps automatic restarts.
+process.on('unhandledRejection', e => console.error('[process] unhandled rejection:', e && e.message ? e.message : e));
+process.on('uncaughtException', e => console.error('[process] uncaught exception (kept running):', e && e.stack ? e.stack : e));
+
+// ---- Simple in-memory rate limiter (fine for a single instance) ----
+const rlBuckets = new Map(); // key -> { n, reset }
+function rateLimit({ name, windowMs, max, keyFn }) {
+  return (req, res, next) => {
+    const k = name + ':' + ((keyFn && keyFn(req)) || req.ip || 'anon');
+    const now = Date.now();
+    let b = rlBuckets.get(k);
+    if (!b || b.reset <= now) { b = { n: 0, reset: now + windowMs }; rlBuckets.set(k, b); }
+    if (++b.n > max) {
+      res.set('Retry-After', String(Math.ceil((b.reset - now) / 1000)));
+      return res.status(429).json({ error: 'Too many requests — please slow down and try again shortly.' });
+    }
+    next();
+  };
+}
+setInterval(() => { const now = Date.now(); for (const [k, b] of rlBuckets) if (b.reset <= now) rlBuckets.delete(k); }, 60 * 1000).unref();
+const codeOf = req => String(req.headers['x-access-code'] || (req.body && req.body.code) || req.query.code || '')
+  .toUpperCase().replace(/[^A-Z0-9]/g, '') || null;
+const limitAuth   = rateLimit({ name: 'auth', windowMs: 10 * 60 * 1000, max: 20 });                  // per IP: brute-force guard
+const limitByCode = rateLimit({ name: 'code', windowMs: 10 * 60 * 1000, max: 300, keyFn: codeOf });  // per rep: photos/stocks/track
+const limitAi     = rateLimit({ name: 'ai',   windowMs: 10 * 60 * 1000, max: 30,  keyFn: codeOf });  // per rep: AI bursts
+
 // CORS middleware
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -288,16 +317,20 @@ function verifyApiKey(req, storeId) {
 
 // Fetch (if stale) and send a store's CSV with change-detection headers.
 // Shared by the legacy /csv/:storeId route and the code-authed /feed route.
+const csvInflight = {};   // storeId -> Promise: concurrent callers share ONE SFTP fetch
 async function serveStoreCsv(res, storeId) {
   if (!isCacheFresh(storeId)) {
     try {
-      await fetchCSVFromSFTP(storeId);
+      if (!csvInflight[storeId]) {
+        csvInflight[storeId] = fetchCSVFromSFTP(storeId).finally(() => { delete csvInflight[storeId]; });
+      }
+      await csvInflight[storeId];
     } catch (error) {
       console.error(`Failed to fetch CSV for ${storeId}:`, error.message);
       if (csvCache[storeId].content) {
         console.log(`Using stale cached CSV for ${storeId}`);
       } else {
-        return res.status(500).json({ error: 'Failed to fetch CSV from SFTP', message: error.message });
+        return res.status(500).json({ error: 'Inventory feed is temporarily unavailable.' });
       }
     }
   }
@@ -326,7 +359,7 @@ app.get('/health', (req, res) => {
     multiStore: isMultiStore,
     aiConfigured: !!ANTHROPIC_API_KEY,   // boolean only — never exposes the key
     aiModel: ANTHROPIC_MODEL,
-    build: 'retry-3-fallback',           // bump on deploys to confirm which code is live
+    build: 'hardening-1',                // bump on deploys to confirm which code is live
     commit: (process.env.RAILWAY_GIT_COMMIT_SHA || '').slice(0, 7)
   });
 });
@@ -349,6 +382,9 @@ app.get('/stores', (req, res) => {
 
 // Get CSV for specific store
 app.get('/csv/:storeId', async (req, res) => {
+  // The legacy apiKey path predates access codes; with user management on it would
+  // bypass the whole gate (no per-store key configured = open). Disable it.
+  if (users.isReady()) return res.status(403).json({ error: 'Legacy CSV access is disabled — use /feed with an access code' });
   const storeId = req.params.storeId;
 
   if (!stores[storeId]) {
@@ -387,6 +423,7 @@ app.get('/csv/:storeId/status', (req, res) => {
 
 // Legacy endpoint for single-store (backward compatibility)
 app.get('/csv', async (req, res) => {
+  if (users.isReady()) return res.status(403).json({ error: 'Legacy CSV access is disabled — use /feed with an access code' });
   // Use first store or 'default'
   const storeId = Object.keys(stores)[0] || 'default';
   
@@ -423,7 +460,7 @@ app.get('/image-proxy', async (req, res) => {
     const httpModule = isHttps ? https : http;
 
     // Fetch the image
-    httpModule.get(imageUrl, (imageResponse) => {
+    const upstream = httpModule.get(imageUrl, (imageResponse) => {
       // Check if request was successful
       if (imageResponse.statusCode !== 200) {
         return res.status(imageResponse.statusCode).json({ 
@@ -439,10 +476,12 @@ app.get('/image-proxy', async (req, res) => {
       
       // Stream the image data
       imageResponse.pipe(res);
-    }).on('error', (error) => {
-      console.error('Error fetching image:', error);
-      res.status(500).json({ error: 'Failed to fetch image', message: error.message });
     });
+    upstream.on('error', (error) => {
+      console.error('Error fetching image:', error.message);
+      if (!res.headersSent) res.status(502).json({ error: 'Failed to fetch image' });
+    });
+    upstream.setTimeout(15000, () => upstream.destroy(new Error('Image fetch timed out')));
   } catch (error) {
     console.error('Error parsing image URL:', error);
     res.status(400).json({ error: 'Invalid image URL', message: error.message });
@@ -481,7 +520,7 @@ function requireDb(res) {
 }
 
 // Validate an access code -> assigned store
-app.post('/auth', async (req, res) => {
+app.post('/auth', limitAuth, async (req, res) => {
   try {
     if (!users.isReady()) return res.status(503).json({ success: false, error: 'User management not configured yet' });
     const code = (req.body && req.body.code) || req.query.code;
@@ -491,7 +530,8 @@ app.post('/auth', async (req, res) => {
     users.logEvent(u, 'login');
     res.json({ success: true, store: u.store, storeName: stores[u.store].name || u.store, name: u.name });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    console.error('[auth] failed:', e.message);
+    res.status(500).json({ success: false, error: 'Could not verify your code right now.' });
   }
 });
 
@@ -505,7 +545,8 @@ app.get('/feed', async (req, res) => {
     if (!stores[u.store]) return res.status(409).json({ error: `Assigned store "${u.store}" is not configured` });
     return serveStoreCsv(res, u.store);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('[feed] failed:', e.message);
+    res.status(500).json({ error: 'Inventory feed is temporarily unavailable.' });
   }
 });
 
@@ -551,6 +592,16 @@ const DM_GRAPHQL = 'https://api.dealermade-next.com/v4/graphql';
 const dmDomainCache = new Map();   // domain -> { id, exp }
 const dmPhotoCache = new Map();    // vin|domain -> { urls, exteriorColor, interiorColor, exp }
 const dmStockCache = new Map();    // vin|domain -> { stock, exp }
+// A long-lived single process must not grow these Maps forever as inventory turns
+// over: evict expired entries periodically and hard-cap their size.
+const DM_CACHE_MAX = 20000;
+setInterval(() => {
+  const now = Date.now();
+  for (const m of [dmDomainCache, dmPhotoCache, dmStockCache]) {
+    for (const [k, v] of m) if (v.exp <= now) m.delete(k);
+    if (m.size > DM_CACHE_MAX) m.clear();
+  }
+}, 10 * 60 * 1000).unref();
 const DM_DOMAIN_TTL = 12 * 60 * 60 * 1000;
 const DM_PHOTO_TTL = 60 * 60 * 1000;
 
@@ -590,7 +641,9 @@ async function dmDealerWebsiteId(domain) {
   if (c && c.exp > Date.now()) return c.id;
   const d = await dmPost('query($domain:String){dealerWebsiteForDomain(domain:$domain){id}}', { domain: key });
   const id = (d && d.dealerWebsiteForDomain && d.dealerWebsiteForDomain.id) || null;
-  dmDomainCache.set(key, { id, exp: Date.now() + DM_DOMAIN_TTL });
+  // Only a REAL id gets the long TTL. A transient failure must not be remembered as
+  // "no dealer" for 12h — that silently blanks photos + stock for a whole store.
+  dmDomainCache.set(key, { id, exp: Date.now() + (id ? DM_DOMAIN_TTL : 60 * 1000) });
   return id;
 }
 
@@ -620,32 +673,38 @@ async function dmStocks(vins, domain) {
     if (c && c.exp > now) { if (c.stock) out[vin] = c.stock; }
     else need.push(vin);
   }
-  for (let i = 0; i < need.length; i += 40) {
-    const chunk = need.slice(i, i + 40);
+  // Chunks run with bounded concurrency under an overall deadline, so a big list can
+  // never tie up a request for minutes; whatever finishes in time is returned and the
+  // remainder fills in on the next inventory load.
+  const chunks = [];
+  for (let i = 0; i < need.length; i += 40) chunks.push(need.slice(i, i + 40));
+  const deadline = now + 20 * 1000;
+  const runChunk = async (chunk) => {
     const fields = chunk.map((vin, j) =>
       `s${j}: vehicleByVinAndDealerWebsiteId(vin:${JSON.stringify(vin)},dealerWebsiteId:$id){stockNumber}`).join(' ');
     let data = null;
     try { data = await dmPost(`query($id:UUID!){${fields}}`, { id }, true); } catch (e) { data = null; }
-    if (!data) continue; // transient failure — don't cache, retry next load
+    if (!data) return; // transient failure — don't cache, retry next load
     chunk.forEach((vin, j) => {
       const rec = data['s' + j];
       const stock = (rec && rec.stockNumber) || '';
       dmStockCache.set(vin + '|' + domain, { stock, exp: now + DM_PHOTO_TTL });
       if (stock) out[vin] = stock;
     });
+  };
+  for (let i = 0; i < chunks.length && Date.now() < deadline; i += 3) {
+    await Promise.all(chunks.slice(i, i + 3).map(runChunk));
   }
   return out;
 }
 
 // GET /photos?vin=...&domain=...  ->  { photos: [url, ...] }   (access-code gated when DB is on)
-app.get('/photos', async (req, res) => {
+app.get('/photos', limitByCode, async (req, res) => {
   try {
-    if (users.isReady()) {
-      const code = req.headers['x-access-code'] || req.query.code;
-      const u = await users.lookupCode(code);
-      if (!u) return res.status(401).json({ error: 'Invalid or inactive access code' });
-      users.logEvent(u, 'view', req.query.vin);
-    }
+    // Fail CLOSED: never serve dealer data without a verified code, even if the DB is down.
+    if (!users.isReady()) return res.status(503).json({ error: 'User management not configured yet' });
+    const u = await users.lookupCode(req.headers['x-access-code'] || req.query.code);
+    if (!u) return res.status(401).json({ error: 'Invalid or inactive access code' });
     const vin = String(req.query.vin || '').trim();
     const domain = cleanDomain(req.query.domain);
     if (!vin || !domain) return res.status(400).json({ error: 'vin and domain are required' });
@@ -654,49 +713,50 @@ app.get('/photos', async (req, res) => {
     if (cached && cached.exp > Date.now()) {
       return res.json({ photos: cached.urls, exteriorColor: cached.exteriorColor, interiorColor: cached.interiorColor, stockNumber: cached.stockNumber, cached: true });
     }
+    users.logEvent(u, 'view', vin);   // count a view only on a fresh lookup (keeps usage_events lean)
     const dm = await dmVehicle(vin, domain);
     dmPhotoCache.set(ck, { ...dm, exp: Date.now() + DM_PHOTO_TTL });
     res.json({ photos: dm.urls, exteriorColor: dm.exteriorColor, interiorColor: dm.interiorColor, stockNumber: dm.stockNumber });
   } catch (e) {
-    res.status(502).json({ error: e.message });
+    console.error('[photos] failed:', e.message);
+    res.status(502).json({ error: 'Photo service is unavailable right now.' });
   }
 });
 
 // POST /stocks  { domain, vins:[...] }  ->  { stocks: { VIN: stockNumber } }
 // Real DealerMade stock numbers for the whole list (access-code gated like /photos).
-app.post('/stocks', async (req, res) => {
+app.post('/stocks', limitByCode, async (req, res) => {
   try {
-    if (users.isReady()) {
-      const code = req.headers['x-access-code'] || (req.body && req.body.code);
-      const u = await users.lookupCode(code);
-      if (!u) return res.status(401).json({ error: 'Invalid or inactive access code' });
-    }
+    if (!users.isReady()) return res.status(503).json({ error: 'User management not configured yet' });
+    const u = await users.lookupCode(req.headers['x-access-code'] || (req.body && req.body.code));
+    if (!u) return res.status(401).json({ error: 'Invalid or inactive access code' });
     const domain = cleanDomain((req.body && req.body.domain) || '');
     const vins = (req.body && Array.isArray(req.body.vins))
-      ? req.body.vins.map(s => String(s || '').trim()).filter(Boolean).slice(0, 1000)
+      ? req.body.vins.map(s => String(s || '').trim()).filter(Boolean).slice(0, 500)
       : [];
     if (!domain || !vins.length) return res.status(400).json({ error: 'domain and vins are required' });
     const stocks = await dmStocks(vins, domain);
     res.json({ stocks });
   } catch (e) {
-    res.status(502).json({ error: e.message });
+    console.error('[stocks] failed:', e.message);
+    res.status(502).json({ error: 'Stock lookup is unavailable right now.' });
   }
 });
 
 // POST /track  { event, vin }  -> record a per-rep usage event (the extension
 // reports each successful Marketplace fill here). Access-code gated.
-app.post('/track', async (req, res) => {
+app.post('/track', limitByCode, async (req, res) => {
   try {
-    if (!users.isReady()) return res.json({ ok: true });
-    const code = req.headers['x-access-code'] || (req.body && req.body.code);
-    const u = await users.lookupCode(code);
+    if (!users.isReady()) return res.status(503).json({ error: 'User management not configured yet' });
+    const u = await users.lookupCode(req.headers['x-access-code'] || (req.body && req.body.code));
     if (!u) return res.status(401).json({ error: 'Invalid or inactive access code' });
     const event = String((req.body && req.body.event) || '').trim();
     if (!['fill'].includes(event)) return res.status(400).json({ error: 'Unknown event' });
     users.logEvent(u, event, req.body && req.body.vin);
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('[track] failed:', e.message);
+    res.status(500).json({ error: 'Could not record usage.' });
   }
 });
 
@@ -738,7 +798,7 @@ function anthropicOnce(prompt, model) {
       r.on('end', () => resolve({ status: r.statusCode, body: buf, retryAfter: parseInt(r.headers['retry-after'], 10) || 0 }));
     });
     req.on('error', reject);
-    req.setTimeout(30000, () => req.destroy(new Error('Anthropic request timed out')));
+    req.setTimeout(20000, () => req.destroy(new Error('Anthropic request timed out')));
     req.write(data); req.end();
   });
 }
@@ -751,8 +811,11 @@ async function anthropicGenerate(prompt) {
   const RETRYABLE = new Set([429, 500, 502, 503, 529]);
   const PER_MODEL_ATTEMPTS = 2;
   let lastStatus = 0, lastErr = '';
+  const deadline = Date.now() + 40 * 1000;   // overall budget: a request can never hang for minutes
   for (const model of models) {
+    if (Date.now() > deadline) break;
     for (let attempt = 0; attempt < PER_MODEL_ATTEMPTS; attempt++) {
+      if (Date.now() > deadline) break;
       let res;
       try {
         res = await anthropicOnce(prompt, model);
@@ -775,7 +838,7 @@ async function anthropicGenerate(prompt) {
       lastErr = (j.error && j.error.message) || `Anthropic error ${res.status}`;
       console.warn(`[anthropic] ${model} attempt ${attempt + 1} status ${res.status}: ${lastErr}`);
       if (RETRYABLE.has(res.status) && attempt < PER_MODEL_ATTEMPTS - 1) {
-        await aiSleep(res.retryAfter ? res.retryAfter * 1000 : aiBackoff(attempt));
+        await aiSleep(res.retryAfter ? Math.min(res.retryAfter, 5) * 1000 : aiBackoff(attempt)); // cap Retry-After
         continue;
       }
       break;                              // this model failed — try the next one
@@ -835,19 +898,28 @@ Generate only the description text, no additional commentary.`;
 
 // POST /generate-description  { vehicleData, userPrompt }  ->  { description }
 // Access-code gated, same as /feed and /photos.
-app.post('/generate-description', async (req, res) => {
+const AI_DAILY_LIMIT = parseInt(process.env.AI_DAILY_LIMIT || '300', 10) || 300;
+const aiDaily = new Map(); // code -> { day, n } — per-rep daily AI quota (single instance)
+function aiQuotaExceeded(key) {
+  const day = new Date().toISOString().slice(0, 10);
+  let q = aiDaily.get(key);
+  if (!q || q.day !== day) { q = { day, n: 0 }; aiDaily.set(key, q); }
+  return ++q.n > AI_DAILY_LIMIT;
+}
+
+app.post('/generate-description', limitAi, async (req, res) => {
   try {
-    let actor = null;
-    if (users.isReady()) {
-      const code = req.headers['x-access-code'] || (req.body && req.body.code);
-      const u = await users.lookupCode(code);
-      if (!u) return res.status(401).json({ error: 'Invalid or inactive access code' });
-      actor = u;
+    // Fail CLOSED: this endpoint spends real money — never run it without a verified code.
+    if (!users.isReady()) return res.status(503).json({ error: 'User management not configured yet' });
+    const actor = await users.lookupCode(req.headers['x-access-code'] || (req.body && req.body.code));
+    if (!actor) return res.status(401).json({ error: 'Invalid or inactive access code' });
+    if (aiQuotaExceeded(codeOf(req) || String(actor.id))) {
+      return res.status(429).json({ error: `Daily AI description limit reached (${AI_DAILY_LIMIT}). Try again tomorrow.` });
     }
     if (!ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI is not configured on the server yet' });
     const { vehicleData, userPrompt } = req.body || {};
     if (!vehicleData) return res.status(400).json({ error: 'vehicleData is required' });
-    if (actor) users.logEvent(actor, 'description', vehicleData.vin);
+    users.logEvent(actor, 'description', vehicleData.vin);
     const description = await anthropicGenerate(buildVehiclePrompt(vehicleData, userPrompt));
     if (!description) return res.status(502).json({ error: 'Empty response from AI' });
     res.json({ description });

@@ -53,7 +53,7 @@
         "password": "your-password",
         "path": "/MP88683.csv"
       },
-      "apiKey": "5f07f0da8d3e965cd52805776ee72a4f4843dba06c34b3e7"
+      "apiKey": "mp88683-secret-key"
     }
   },
   "server": {

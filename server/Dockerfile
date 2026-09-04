@@ -1,20 +1,17 @@
-﻿# Dockerfile for SFTP Proxy Service
-FROM node:18-alpine
+# Dockerfile for the Beck Auto-Post proxy.
+# NOTE: Railway builds this service with Nixpacks (see /railway.json), so this file
+# is only for running the proxy elsewhere. Build from the server/ directory:
+#   docker build -t beck-auto-post-proxy . && docker run -p 3000:3000 --env-file .env beck-auto-post-proxy
+FROM node:20-alpine
 
-# Set working directory
 WORKDIR /app
 
-# Copy package files
+# Install production dependencies first so the layer caches across code changes
 COPY package*.json ./
+RUN npm install --omit=dev
 
-# Install dependencies
-RUN npm install --production
+# Copy the whole service (sftp-proxy.js, users.js, admin.html, config.json)
+COPY . ./
 
-# Copy application files
-COPY sftp-proxy.js ./
-
-# Expose port 3000
 EXPOSE 3000
-
-# Start the application
 CMD ["node", "sftp-proxy.js"]

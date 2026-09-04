@@ -39,6 +39,7 @@ const state = {
   sel: null,            // selected vehicle index
   photos: [],           // photo URLs for selected vehicle
   picked: new Set(),    // indices of selected photos
+  pickedDirty: false,   // rep changed the selection by hand (don't reset it when the gallery arrives)
   focus: 0,             // focused photo in hero
   desc: '', generated: false,
   filling: false
@@ -69,6 +70,20 @@ function send(action, data) {
     try { chrome.runtime.sendMessage({ action, data }, (resp) => { void chrome.runtime.lastError; resolve(resp || { success: false }); }); }
     catch (e) { resolve({ success: false, error: e.message }); }
   });
+}
+
+// Live progress from the content script while a fill is running.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.action !== 'formFillProgress' || !state.filling) return;
+  const bar = $('fillBar'); if (bar) bar.style.width = Math.max(5, Math.min(100, Number(msg.progress) || 0)) + '%';
+  const nb = $('dockNext'); if (nb && msg.stage) nb.innerHTML = `<span class="spinner"></span><span>${esc(msg.stage)}</span>`;
+});
+
+function ago(ts) {
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60); if (m < 60) return m + ' min ago';
+  const h = Math.round(m / 60); return h + (h === 1 ? ' hr ago' : ' hrs ago');
 }
 
 /* ============================================================
@@ -311,7 +326,7 @@ function renderInventory() {
   skel.hidden = true;
   status.textContent = 'Live feed · auto-updates every ' + (Number(state.settings.refreshMin) || 15) + ' min';
   const rows = filteredVehicles();
-  synced.textContent = `${rows.length} of ${state.vehicles.length} vehicles` + (state.lastSync ? ' · synced just now' : '');
+  synced.textContent = `${rows.length} of ${state.vehicles.length} vehicles` + (state.lastSync ? ' · synced ' + ago(state.lastSync) : '');
   if (!rows.length) {
     list.innerHTML = ''; empty.hidden = false;
     $('invEmptyT').textContent = state.vehicles.length ? 'No matches' : 'No inventory';
@@ -345,6 +360,7 @@ function selectVehicle(i) {
   state.focus = 0; state.generated = false; state.desc = '';
   state.photos = (v.images || []).slice();   // instant: the feed's primary photo
   state.picked = new Set(state.photos.map((_, k) => k).slice(0, MAX_PHOTOS));
+  state.pickedDirty = false;
   go(2);
   toast(`${v.title} selected`);
   loadGallery(i, v);                          // then pull the full DealerMade gallery
@@ -370,8 +386,14 @@ async function loadGallery(i, v) {
     }
     const gallery = (data && data.photos) || [];
     if (gallery.length && state.sel === i) {
+      // If the rep already touched the selection, carry it over by URL instead of
+      // silently resetting to "first 20" underneath them.
+      const keepUrls = state.pickedDirty ? new Set([...state.picked].map(k => state.photos[k])) : null;
       state.photos = gallery;
-      state.picked = new Set(state.photos.map((_, k) => k).slice(0, MAX_PHOTOS));
+      state.picked = keepUrls
+        ? new Set(gallery.map((u, k) => keepUrls.has(u) ? k : -1).filter(k => k >= 0).slice(0, MAX_PHOTOS))
+        : new Set(gallery.map((_, k) => k).slice(0, MAX_PHOTOS));
+      if (state.focus >= gallery.length) state.focus = 0;
       if (state.step === 2) renderPhotos();
       updateDock();
     }
@@ -420,14 +442,16 @@ function renderPhotos() {
   $('heroPrev').onclick = () => { state.focus = (state.focus - 1 + state.photos.length) % state.photos.length; renderPhotos(); };
   $('heroNext').onclick = () => { state.focus = (state.focus + 1) % state.photos.length; renderPhotos(); };
   $('btnSelAll').onclick = () => {
+    state.pickedDirty = true;
     state.picked = new Set(state.photos.map((_, k) => k).slice(0, MAX_PHOTOS));
     if (state.photos.length > MAX_PHOTOS) toast('Facebook allows 20 — selected the first 20', 'warn');
     renderPhotos(); updateDock();
   };
-  $('btnSelNone').onclick = () => { state.picked = new Set(); renderPhotos(); updateDock(); };
+  $('btnSelNone').onclick = () => { state.pickedDirty = true; state.picked = new Set(); renderPhotos(); updateDock(); };
 }
 
 function togglePhoto(j) {
+  state.pickedDirty = true;
   if (state.picked.has(j)) state.picked.delete(j);
   else {
     if (state.picked.size >= MAX_PHOTOS) { toast('Facebook allows up to 20 photos', 'warn'); renderPhotos(); return; }
@@ -571,7 +595,7 @@ async function fillMarketplace() {
   state.filling = true;
   const nb = $('dockNext');
   nb.disabled = true; nb.innerHTML = '<span class="spinner"></span><span>Opening Marketplace…</span>';
-  const prog = $('fillProgress'); prog.hidden = false; $('fillBar').style.width = '10%';
+  const prog = $('fillProgress'); prog.hidden = false; $('fillBar').style.width = '5%';
   $('fillResult').innerHTML = '';
 
   // Persist what the content script needs
@@ -594,11 +618,11 @@ async function fillMarketplace() {
   try {
     const tabId = await ensureMarketplaceTab();
     if (!tabId) throw new Error('Could not open the Marketplace tab');
-    $('fillBar').style.width = '30%';
+    $('fillBar').style.width = '12%';
     nb.innerHTML = '<span class="spinner"></span><span>Loading page…</span>';
     const ready = await waitForContentScript(tabId);
     if (!ready) throw new Error('Marketplace page did not respond. Make sure you are logged into Facebook.');
-    $('fillBar').style.width = '55%';
+    $('fillBar').style.width = '20%';   // the content script reports 25→100 from here
     nb.innerHTML = '<span class="spinner"></span><span>Filling listing…</span>';
     const resp = await sendToTab(tabId, { action: 'fillForm' });
     $('fillBar').style.width = '100%';
@@ -621,17 +645,31 @@ function trackEvent(event, vin) {
   } catch (e) {}
 }
 
+const FIELD_LABELS = {
+  year: 'Year', vehicleType: 'Vehicle type', make: 'Make', model: 'Model', mileage: 'Mileage',
+  title: 'Title', price: 'Price', description: 'Description', category: 'Category',
+  location: 'Location', additionalFields: 'Body style / color'
+};
+
 function finishFill(resp, requested) {
   state.filling = false;
   updateDock();
   const r = $('fillResult');
   const attached = resp && typeof resp.photosAttached === 'number' ? resp.photosAttached
     : (resp && resp.success ? requested : 0);
-  if (resp && resp.success && attached > 0) {
+  // The content script verifies each field it filled; surface anything that didn't
+  // stick so the rep checks it instead of publishing a listing with a blank price.
+  const fields = (resp && resp.fields) || {};
+  const missing = Object.keys(fields).filter(k => fields[k] === false && k !== 'photos').map(k => FIELD_LABELS[k] || k);
+  const checkNote = missing.length ? ` <b>Check before publishing:</b> ${esc(missing.join(', '))}.` : '';
+  if (resp && resp.success && attached > 0 && !missing.length) {
     r.innerHTML = `<div class="result result--ok"><i class="ti ti-circle-check"></i><div><b>Listing filled — ${attached} of ${requested} photos attached.</b> Switch to the Facebook tab to review and publish.</div></div>`;
     toast(`Filled with ${attached} photos`);
+  } else if (resp && resp.success && attached > 0) {
+    r.innerHTML = `<div class="result result--warn"><i class="ti ti-alert-triangle"></i><div><b>Listing filled — ${attached} of ${requested} photos attached.</b>${checkNote}</div></div>`;
+    toast('Filled — check ' + missing.join(', '), 'warn');
   } else if (resp && resp.success) {
-    r.innerHTML = `<div class="result result--warn"><i class="ti ti-alert-triangle"></i><div><b>Listing filled, but no photos attached.</b> Do not publish — add photos manually, or try again.</div></div>`;
+    r.innerHTML = `<div class="result result--warn"><i class="ti ti-alert-triangle"></i><div><b>Listing filled, but no photos attached.</b> Do not publish — add photos manually, or try again.${checkNote}</div></div>`;
     toast('No photos attached', 'warn');
   } else {
     const msg = (resp && resp.error) || 'Fill failed — is the Marketplace page open and logged in?';
@@ -747,7 +785,10 @@ async function signOut() {
 /* ============================================================
    Init
    ============================================================ */
+let booted = false;
 async function init() {
+  if (booted) return;   // DOMContentLoaded and the readyState fallback can both fire
+  booted = true;
   const saved = await sget(['beckSettings', 'accessCode']);
   state.settings = { ...DEFAULTS, ...(saved.beckSettings || {}) };
   state.accessCode = saved.accessCode || null;

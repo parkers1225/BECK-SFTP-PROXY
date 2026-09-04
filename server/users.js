@@ -32,7 +32,13 @@ async function initDb() {
     console.warn('⚠️  "pg" module not installed — user management OFF. Run `npm install` on the server.');
     return false;
   }
-  pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: sslFor(process.env.DATABASE_URL), max: 4 });
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL, ssl: sslFor(process.env.DATABASE_URL),
+    max: 6, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000
+  });
+  // Managed Postgres drops idle connections; without this listener that surfaces as
+  // an unhandled 'error' event and crashes the process (and Railway caps restarts).
+  pool.on('error', e => console.error('[pg] idle client error (recovered):', e.message));
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_users (
       id SERIAL PRIMARY KEY,
@@ -54,7 +60,11 @@ async function initDb() {
     )
   `);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_events (user_id, created_at)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_usage_event_time ON usage_events (event, created_at)');
   ready = true;
+  // Keep usage_events bounded: prune old rows daily (USAGE_RETENTION_DAYS, default 180).
+  pruneEvents().catch(() => {});
+  setInterval(() => pruneEvents().catch(() => {}), 24 * 60 * 60 * 1000).unref();
   console.log('✅ User management ready (Postgres)');
   return true;
 }
@@ -84,8 +94,19 @@ async function lookupCode(code) {
   );
   const row = rows[0];
   const user = (row && row.active) ? { id: row.id, name: row.name, store: row.store } : null;
-  cache.set(key, { user, exp: Date.now() + CACHE_MS });
+  // Only cache successful lookups — caching every bogus code would let unlimited
+  // guesses grow this Map without bound.
+  if (user) cache.set(key, { user, exp: Date.now() + CACHE_MS });
   return user;
+}
+
+const RETENTION_DAYS = parseInt(process.env.USAGE_RETENTION_DAYS || '180', 10) || 180;
+async function pruneEvents() {
+  if (!ready) return;
+  const { rowCount } = await pool.query(
+    "DELETE FROM usage_events WHERE created_at < now() - ($1 || ' days')::interval", [String(RETENTION_DAYS)]
+  );
+  if (rowCount) console.log(`[usage] pruned ${rowCount} events older than ${RETENTION_DAYS}d`);
 }
 
 function invalidate() { cache.clear(); }

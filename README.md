@@ -89,14 +89,14 @@ BECK-AUTO-POST/
 ├── popup.css              # UI styling
 ├── popup.js               # UI logic
 ├── content.js             # Content script for Facebook Marketplace
-├── background.js          # Background service worker
+├── background.js          # Service worker: AI requests via the proxy + photo fetches
+├── intro.js               # Open animation (three.js), once per browser session
 ├── privacy-policy.html    # Privacy policy
-├── utils/
-│   ├── csvParser.js       # CSV parsing utility
-│   ├── vinMatcher.js      # VIN extraction utility
-│   └── aiService.js       # AI description generation
+├── lib/                   # Bundled three.js
+├── fonts/                 # Bundled UI fonts
 ├── icons/
-│   └── beck-logo.png      # Extension icon (used for all sizes)
+│   ├── beck-logo.png      # Extension icon (used for all sizes)
+│   └── beck-wordmark.png  # Beck wordmark (topbar + intro)
 ├── server/                # SFTP proxy server (see server/README.md)
 ├── package.json           # Root deploy wrapper (runs the server)
 ├── railway.json           # Railway deployment config
